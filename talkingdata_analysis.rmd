@@ -1,0 +1,330 @@
+---
+title: "TalkingData Analysis"
+author: "Abhinav Maurya"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: cerulean
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+options(warn=-1)
+
+library(stats)
+library(gam)
+library(ggplot2)
+library(knitr)
+library(plyr)
+library(randomForest)
+library(rpart)
+library(caret)
+library(caretEnsemble)
+library(caTools)
+library(nnet)
+library(splines)
+library(pROC)
+library(xgboost)
+library(dplyr)
+library(sp)
+library(rworldmap)
+library(rworldxtra)
+library(maps)
+library(rgeos)
+library(maptools)
+library(lubridate)
+library(Hmisc)
+library(tidyr)
+library(Matrix)
+library(corrplot)
+library(rBayesianOptimization)
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+options(scipen = 4)
+
+data_directory = "/Users/ibmuser/Dropbox/datascience/talkingdata/"
+setwd(data_directory)
+```
+
+```{r helper functions}
+setClass("date_convertor")
+setAs("character", "date_convertor", function(from) as.POSIXct(strptime(from, format="%Y-%m-%d %H:%M:%S")) )
+
+as.numeric.factor <- function(x) { seq_along(levels(x))[x]-1 }
+
+coords2features = function(latitude, longitude)
+{
+  points = data.frame(lat=latitude, lon=longitude)
+  
+  # low res map
+  countriesSP <- getMap(resolution='low')
+  # high res map
+  #countriesSP <- getMap(resolution='high')
+
+  pointsSP = SpatialPoints(points, proj4string=CRS(proj4string(countriesSP)))
+
+  indices = over(pointsSP, countriesSP)
+
+  list(continent = indices$REGION, country = indices$ADMIN, country_iso3 = indices$ISO3)
+}
+
+coords2features(-121.806735, 37.211104)
+
+coords2features(121, 31.2)
+
+time2features = function(time)
+{
+  list(numeric_time = as.numeric(time),
+       hour_of_day = hour(time),
+       minute_of_day = 60*hour(time) + minute(time),
+       second_of_day = 3600*hour(time) + 60*minute(time) + second(time),
+       day_of_week = wday(time),
+       day_of_month = mday(time),
+       day_of_quarter = qday(time),
+       day_of_year = yday(time),
+       week_of_year = week(time),
+       month_of_year = month(time),
+       year = year(time))
+}
+
+time2features(strptime("2009-09-02 05:05:05", format="%Y-%m-%d %H:%M:%S"))
+```
+
+## Import and process data
+
+```{r load CSV files}
+ptm <- proc.time()
+
+gender_age_train <- read.csv(paste(data_directory, "gender_age_train.csv", sep=''), header=TRUE, colClasses=c(device_id="character"))
+gender_age_test <- read.csv(paste(data_directory, "gender_age_test.csv", sep=''), header=TRUE, colClasses=c(device_id="character"))
+gender_age_output <- read.csv(paste(data_directory, "sample_submission.csv", sep=''), header=TRUE, colClasses=c(device_id="character"))
+phone_brand_device_model <- read.csv(paste(data_directory, "phone_brand_device_model.csv", sep=''), header=TRUE, colClasses=c(device_id="character"))
+
+app_labels <- read.csv(paste(data_directory, "app_labels.csv", sep=''), header=TRUE, colClasses=c(app_id="character", label_id="character"))
+label_categories <- read.csv(paste(data_directory, "label_categories.csv", sep=''), header=TRUE, colClasses=c(label_id="character"))
+app_events <- read.csv(paste(data_directory, "app_events.csv", sep=''), header=TRUE, colClasses=c(app_id="character", event_id="character", is_installed="factor", is_active="factor"))
+events <- read.csv(paste(data_directory, "events.csv", sep=''), header=TRUE, colClasses=c(device_id="character", event_id="character", timestamp="date_convertor", latitude="numeric", longitude="numeric"))
+
+# save(list = ls(all=TRUE), file="talkingdata.RData")
+# load("talkingdata.RData")
+
+proc.time() - ptm
+```
+
+```{r data preprocessing}
+ptm <- proc.time()
+
+time_features <- time2features(events$timestamp)
+events <- bind_cols(events, time_features)
+rm(time_features)
+
+spatial_features <- coords2features(events$longitude, events$latitude)
+events <- bind_cols(events, spatial_features)
+rm(spatial_features)
+
+app_label_categories <- full_join(x = app_labels, y = label_categories, by = "label_id")
+app_event_categories <- full_join(x = app_events, y = app_label_categories, by = "app_id")
+events_all <- full_join(x = events, y = app_event_categories, by = "event_id")
+rm(app_labels, label_categories, app_events, app_label_categories, events, app_event_categories)
+
+events_all$label_id <- NULL
+events_all$timestamp <- NULL
+
+proc.time() - ptm
+```
+
+```{r feature extraction}
+ptm <- proc.time()
+
+events_grouped <- events_all %>%
+  group_by(device_id)
+
+category_installed_counts <- events_grouped %>%
+  count(category) %>%
+  spread(category, n)
+
+category_active_counts <- events_grouped %>%
+  filter(is_active == "1") %>%
+  count(category) %>%
+  spread(category, n)
+
+categorical_features <- full_join(category_installed_counts, category_active_counts, by = "device_id")
+categorical_features[is.na(categorical_features)] <- 0
+rm(category_installed_counts, category_active_counts)
+
+numeric_features <- events_grouped %>%
+  summarise(n = n(),
+            lat_mean = mean(latitude),
+            lon_mean = mean(longitude),
+            time_mean = mean(numeric_time),
+            hour_of_day_mean = mean(hour_of_day),
+            minute_of_day_mean = mean(minute_of_day),
+            second_of_day_mean = mean(second_of_day),
+            day_of_week_mean = mean(day_of_week),
+            day_of_month_mean = mean(day_of_month),
+            day_of_quarter_mean = mean(day_of_quarter),
+            day_of_year_mean = mean(day_of_year),
+            week_of_year_mean = mean(week_of_year),
+            month_of_year_mean = mean(month_of_year),
+            year_mean = mean(year),
+            continent = names(which.max(table(continent))),
+            country = names(which.max(table(country)))
+            )
+numeric_features[["continent"]] <- as.factor(numeric_features[["continent"]])
+numeric_features[["country"]] <- as.factor(numeric_features[["country"]])
+
+devices_all <- full_join(data.frame(categorical_features), data.frame(numeric_features), by = "device_id")
+devices_all <- full_join(phone_brand_device_model, devices_all, by = "device_id")
+
+devices_all[is.na(devices_all)] <- 0
+devices_all <- subset(devices_all, !duplicated(device_id))
+rm(events_all, events_grouped, categorical_features, numeric_features, app_features, phone_brand_device_model)
+
+# save(devices_all, file="devices_all.RData")
+# load("devices_all.RData")
+
+proc.time() - ptm
+```
+
+```{r preparing train and test datasets for xgboost}
+ptm <- proc.time()
+
+# option to allow model.matrix to create NA values in rows
+options(na.action='na.pass')
+
+# finding any categorical or character columns
+which(sapply(devices_all, is.factor))
+which(sapply(devices_all, is.character))
+
+# prepare train data
+train <- left_join(gender_age_train, devices_all, by = "device_id", match = "first")
+train_x <- train[, -which(names(train) %in% c("device_id", "group", "gender", "age"))]
+train_x <- model.matrix(~.-1, data = train_x)
+train_y <- as.numeric.factor(train[, c("group")])
+
+# prepare test data
+test <- left_join(gender_age_test, devices_all, by = "device_id")
+test_x <- test[, -which(names(test) %in% c("device_id", "group", "gender", "age"))]
+test_x <- model.matrix(~.-1, data = test_x)
+test_ids <- test[, "device_id"]
+
+# number of classes
+num_classes <- 12
+
+# test if column names for train and test datasets are identical
+all(colnames(train_x) == colnames(test_x))
+
+# print column names
+colnames(train_x)
+```
+
+```{r prepare xgboost data}
+# prepare xgboost data matrix
+xgboost_matrix <- xgb.DMatrix(data = train_x, label = train_y, missing = NaN)
+
+# choose smaller subset for cross-validation
+xgboost_matrix_cv = xgb.DMatrix(data = train_x[1:1000,], label = train_y[1:1000], missing = NaN)
+```
+
+```{r xgboost hyperparameter grid search}
+# do grid search for parameters using smaller CV data
+searchGrid <- expand.grid(subsample = c(0.7, 0.8, 0.9),
+                          colsample_bytree = c(0.7, 0.8, 0.9),
+                          max_depth = c(1, 2, 3, 4),
+                          eta = c(0.2, 0.4, 0.6, 0.8))
+
+mloglossHyperparameters <- apply(searchGrid, 1, function(parameterList){
+    # extract parameters to test
+    current_subsample_rate <- parameterList[["subsample"]]
+    current_colsample_rate <- parameterList[["colsample_bytree"]]
+    current_max_depth <- parameterList[["max_depth"]]
+    current_eta <- parameterList[["eta"]]
+    
+    print(current_subsample_rate)
+    print(current_colsample_rate)
+    print(current_max_depth)
+    print(current_eta)
+
+    xgboost_model_cv <- xgb.cv(data =  xgboost_matrix_cv, missing = NaN, num_class = num_classes,
+                             nround = 10, nthread = 2,  
+                             max.depth = current_max_depth, eta = current_eta, early.stop.round = 3,
+                             metrics = "mlogloss", eval_metric = "mlogloss", objective = "multi:softprob",
+                             subsample = current_subsample_rate, colsample_bytree = current_colsample_rate,
+                             verbose = TRUE, showsd = TRUE, maximize = TRUE, nfold = 5)
+
+    xgboost_validation_scores <- as.data.frame(xgboost_model_cv)
+    
+    #save mean cross-validation logloss of the last iteration
+    mlogloss <- tail(xgboost_validation_scores$test.mlogloss.mean, 1)
+
+    return(c(mlogloss, current_subsample_rate, current_colsample_rate, current_max_depth))
+})
+```
+
+```{r xgboost bayesian hyperparameter optimization}
+cv_folds <- KFold(getinfo(xgboost_matrix, 'label'), nfolds = 5, stratified = TRUE, seed = 0)
+
+xgb_cv_bayes <- function(max.depth, subsample, colsample_bytree, eta) {
+  cv <- xgb.cv(params = list(max.depth = max.depth, subsample = subsample, colsample_bytree = colsample_bytree,
+                             booster = "gbtree", eta = eta,
+                             missing = NaN, num_class = num_classes, nthread = 4,
+                             metrics = "mlogloss", eval_metric = "mlogloss", objective = "multi:softprob"),
+               data = xgboost_matrix, nround = 20,
+               folds = cv_folds, prediction = TRUE, showsd = TRUE,
+               early.stop.round = 3, maximize = TRUE, verbose = TRUE)
+  list(Score = -cv$dt[, max(test.mlogloss.mean)], Pred = cv$pred)
+}
+
+opt_result <- BayesianOptimization(xgb_cv_bayes,
+                  bounds = list(max.depth = c(1L, 3L),
+                                subsample = c(0.5, 0.9),
+                                colsample_bytree = c(0.5, 0.9),
+                                eta = c(0.01, 0.99)),
+                  init_points = 10, n_iter = 30, acq = "ucb", kappa = 2.576, eps = 0, verbose = TRUE)
+```
+
+```{r build model using best paramters from grid search or bayesian optimization}
+# best hyperparameters
+current_subsample_rate <- 0.9
+current_colsample_rate <- 0.9
+current_eta <- 0.95
+current_max_depth <- 3
+max_rounds <- 100
+
+# do CV for finding appropriate number of rounds with entire data and chosen hyperparameters
+history <- xgb.cv(data =  xgboost_matrix, missing = NaN, num_class = num_classes,
+                             nround = max_rounds, nthread = 2,
+                             max.depth = current_max_depth, eta = current_eta,
+                             metrics = "mlogloss", eval_metric = "mlogloss", objective = "multi:softprob", 
+                             subsample = current_subsample_rate, colsample_bytree = current_colsample_rate,
+                             verbose = TRUE, showsd = TRUE, maximize = TRUE, nfold = 5)
+
+# max rounds after which CV error increases
+max_rounds <- 18
+
+# build model
+xgboost_model <- xgboost(data = xgboost_matrix, missing = NaN, num_class = num_classes,
+                         nround = max_rounds, nthread = 1,
+                         max.depth = current_max_depth, eta = current_eta,
+                         metrics = "mlogloss", eval_metric = "mlogloss", objective = "multi:softprob",
+                         subsample = current_subsample_rate, colsample_bytree = current_colsample_rate)
+```
+
+```{r making and saving predictions}
+# predict softmax probabilities
+xgboost_probabilities <- predict(xgboost_model, test_x)
+xgboost_probabilities <- data.frame(t(matrix(xgboost_probabilities, nrow=length(xgboost_probabilities)/nrow(test_x), ncol=nrow(test_x))))
+xgboost_probabilities$device_id = test_ids
+
+# preparing kaggle output
+xgboost_probabilities <- left_join(gender_age_test, xgboost_probabilities, by = "device_id")
+colnames(xgboost_probabilities) <- c("device_id","F23-","F24-26","F27-28","F29-32","F33-42","F43+","M22-","M23-26","M27-28","M29-31","M32-38","M39+")
+xgboost_probabilities <- subset(xgboost_probabilities, !duplicated(device_id))
+write.csv(xgboost_probabilities, paste(data_directory, "results.csv", sep=''), row.names = FALSE, quote = FALSE)
+
+proc.time() - ptm
+```
