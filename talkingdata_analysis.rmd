@@ -9,6 +9,8 @@ output:
     highlight: tango
 ---
 
+## Initialization
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -137,6 +139,9 @@ events_all$timestamp <- NULL
 proc.time() - ptm
 ```
 
+
+## Feature Extraction
+
 ```{r feature extraction}
 ptm <- proc.time()
 
@@ -190,6 +195,8 @@ rm(events_all, events_grouped, categorical_features, numeric_features, app_featu
 proc.time() - ptm
 ```
 
+## Preparing training and testing data
+
 ```{r preparing train and test datasets for xgboost}
 ptm <- proc.time()
 
@@ -230,6 +237,8 @@ xgboost_matrix <- xgb.DMatrix(data = train_x, label = train_y, missing = NaN)
 xgboost_matrix_cv = xgb.DMatrix(data = train_x[1:1000,], label = train_y[1:1000], missing = NaN)
 ```
 
+## Grid Search for Choosing Hyperparameters
+
 ```{r xgboost hyperparameter grid search}
 # do grid search for parameters using smaller CV data
 searchGrid <- expand.grid(subsample = c(0.7, 0.8, 0.9),
@@ -265,6 +274,8 @@ mloglossHyperparameters <- apply(searchGrid, 1, function(parameterList){
 })
 ```
 
+## Bayesian Optimization for Choosing Hyperparameters
+
 ```{r xgboost bayesian hyperparameter optimization}
 cv_folds <- KFold(getinfo(xgboost_matrix, 'label'), nfolds = 5, stratified = TRUE, seed = 0)
 
@@ -286,6 +297,8 @@ opt_result <- BayesianOptimization(xgb_cv_bayes,
                                 eta = c(0.01, 0.99)),
                   init_points = 10, n_iter = 30, acq = "ucb", kappa = 2.576, eps = 0, verbose = TRUE)
 ```
+
+## Build model using chosen hyperparameters
 
 ```{r build model using best paramters from grid search or bayesian optimization}
 # best hyperparameters
@@ -313,6 +326,8 @@ xgboost_model <- xgboost(data = xgboost_matrix, missing = NaN, num_class = num_c
                          metrics = "mlogloss", eval_metric = "mlogloss", objective = "multi:softprob",
                          subsample = current_subsample_rate, colsample_bytree = current_colsample_rate)
 ```
+
+## Make predictions and save softmax probabilities
 
 ```{r making and saving predictions}
 # predict softmax probabilities
